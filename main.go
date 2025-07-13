@@ -17,13 +17,17 @@ var client *fasthttp.Client
 
 func main() {
 	h := requestHandler
-	
+
 	client = &fasthttp.Client{
-		ReadTimeout: time.Duration(timeout) * time.Second,
+		ReadTimeout:         time.Duration(timeout) * time.Second,
 		MaxIdleConnDuration: 60 * time.Second,
 	}
 
-	if err := fasthttp.ListenAndServe(":" + port, h); err != nil {
+	if port == "" {
+		port = "8080" // fallback for Railway
+	}
+
+	if err := fasthttp.ListenAndServe(":"+port, h); err != nil {
 		log.Fatalf("Error in ListenAndServe: %s", err)
 	}
 }
@@ -37,52 +41,59 @@ func requestHandler(ctx *fasthttp.RequestCtx) {
 		return
 	}
 
-	if len(strings.SplitN(string(ctx.Request.Header.RequestURI())[1:], "/", 2)) < 2 {
+	pathParts := strings.SplitN(string(ctx.Request.Header.RequestURI())[1:], "/", 2)
+	if len(pathParts) < 2 {
 		ctx.SetStatusCode(400)
-		ctx.SetBody([]byte("URL format invalid."))
+		ctx.SetBody([]byte("URL format invalid. Expected /subdomain/path"))
 		return
 	}
 
-	response := makeRequest(ctx, 1)
-
+	response := makeRequest(ctx, pathParts, 1)
 	defer fasthttp.ReleaseResponse(response)
 
-	body := response.Body()
-	ctx.SetBody(body)
 	ctx.SetStatusCode(response.StatusCode())
-	response.Header.VisitAll(func (key, value []byte) {
+	ctx.SetBody(response.Body())
+	response.Header.VisitAll(func(key, value []byte) {
 		ctx.Response.Header.Set(string(key), string(value))
 	})
 }
 
-func makeRequest(ctx *fasthttp.RequestCtx, attempt int) *fasthttp.Response {
+func makeRequest(ctx *fasthttp.RequestCtx, pathParts []string, attempt int) *fasthttp.Response {
 	if attempt > retries {
 		resp := fasthttp.AcquireResponse()
 		resp.SetBody([]byte("Proxy failed to connect. Please try again."))
 		resp.SetStatusCode(500)
-
 		return resp
 	}
 
 	req := fasthttp.AcquireRequest()
 	defer fasthttp.ReleaseRequest(req)
+
+	subdomain := pathParts[0]
+	path := pathParts[1]
+
+	fullURL := "https://" + subdomain + ".roblox.com/" + path
+	req.SetRequestURI(fullURL)
 	req.Header.SetMethod(string(ctx.Method()))
-	url := strings.SplitN(string(ctx.Request.Header.RequestURI())[1:], "/", 2)
-	req.SetRequestURI("https://" + url[0] + ".roblox.com/" + url[1])
 	req.SetBody(ctx.Request.Body())
-	ctx.Request.Header.VisitAll(func (key, value []byte) {
+
+	// copy headers from client request to proxy request
+	ctx.Request.Header.VisitAll(func(key, value []byte) {
 		req.Header.Set(string(key), string(value))
 	})
-	req.Header.Set("User-Agent", "RoProxy")
-	req.Header.Del("Roblox-Id")
-	resp := fasthttp.AcquireResponse()
 
+	// spoofing to avoid being blocked
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
+	req.Header.Set("Accept", "application/json")
+	req.Header.Del("Roblox-Id") // remove any Roblox-Id just in case
+
+	resp := fasthttp.AcquireResponse()
 	err := client.Do(req, resp)
 
-    if err != nil {
+	if err != nil {
 		fasthttp.ReleaseResponse(resp)
-        return makeRequest(ctx, attempt + 1)
-    } else {
-		return resp
+		return makeRequest(ctx, pathParts, attempt+1)
 	}
+
+	return resp
 }
