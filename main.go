@@ -1,6 +1,7 @@
 package main
 
 import (
+    "bytes"
     "fmt"
     "log"
     "os"
@@ -12,11 +13,12 @@ import (
 )
 
 var (
-    timeoutSec = mustAtoi(os.Getenv("TIMEOUT"), 10)   // default 10s
-    retries    = mustAtoi(os.Getenv("RETRIES"), 3)    // default 3 retries
-    port       = os.Getenv("PORT")
-    proxyKey   = os.Getenv("KEY")
-    client     *fasthttp.Client
+    timeoutSec   = mustAtoi(os.Getenv("TIMEOUT"), 10)   // default 10s
+    retries      = mustAtoi(os.Getenv("RETRIES"), 3)    // default 3 retries
+    port         = os.Getenv("PORT")
+    proxyKey     = os.Getenv("KEY")
+    robloxCookie = os.Getenv("ROBLOX_COOKIE")          // .ROBLOSECURITY cookie, e.g. ".ROBLOSECURITY=..."
+    client       *fasthttp.Client
 )
 
 func mustAtoi(s string, fallback int) int {
@@ -54,7 +56,7 @@ func requestHandler(ctx *fasthttp.RequestCtx) {
 
     log.Printf("%s %s\n", ctx.Method(), ctx.Request.URI().String())
 
-    // auth
+    // auth via PROXYKEY
     if proxyKey != "" {
         key := string(ctx.Request.Header.Peek("PROXYKEY"))
         if key != proxyKey {
@@ -102,14 +104,20 @@ func makeRequest(ctx *fasthttp.RequestCtx, parts []string, attempt int) *fasthtt
     req.SetRequestURI(upstream)
     req.SetBody(ctx.Request.Body())
 
-    // copy headers
+    // copy headers from incoming, except hop-by-hop
     ctx.Request.Header.VisitAll(func(k, v []byte) {
         req.Header.SetBytesKV(k, v)
     })
-    // spoof UA
+
+    // spoof UA and enforce JSON
     req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
     req.Header.Set("Accept", "application/json")
     req.Header.Del("Roblox-Id")
+
+    // attach authenticated cookie if provided
+    if robloxCookie != "" {
+        req.Header.Set("Cookie", robloxCookie)
+    }
 
     resp := fasthttp.AcquireResponse()
     if err := client.Do(req, resp); err != nil {
