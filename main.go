@@ -1,99 +1,123 @@
 package main
 
 import (
-	"log"
-	"time"
-	"os"
-	"github.com/valyala/fasthttp"
-	"strconv"
-	"strings"
+    "fmt"
+    "log"
+    "os"
+    "strconv"
+    "strings"
+    "time"
+
+    "github.com/valyala/fasthttp"
 )
 
-var timeout, _ = strconv.Atoi(os.Getenv("TIMEOUT"))
-var retries, _ = strconv.Atoi(os.Getenv("RETRIES"))
-var port = os.Getenv("PORT")
+var (
+    timeoutSec = mustAtoi(os.Getenv("TIMEOUT"), 10)   // default 10s
+    retries    = mustAtoi(os.Getenv("RETRIES"), 3)    // default 3 retries
+    port       = os.Getenv("PORT")
+    proxyKey   = os.Getenv("KEY")
+    client     *fasthttp.Client
+)
 
-var client *fasthttp.Client
+func mustAtoi(s string, fallback int) int {
+    if v, err := strconv.Atoi(s); err == nil {
+        return v
+    }
+    return fallback
+}
 
 func main() {
-	h := requestHandler
+    if port == "" {
+        port = "8080"
+    }
+    log.Printf("🚀 starting RoProxy Lite on port %s (timeout=%ds, retries=%d)\n", port, timeoutSec, retries)
 
-	client = &fasthttp.Client{
-		ReadTimeout:         time.Duration(timeout) * time.Second,
-		MaxIdleConnDuration: 60 * time.Second,
-	}
+    client = &fasthttp.Client{
+        ReadTimeout:         time.Duration(timeoutSec) * time.Second,
+        MaxIdleConnDuration: 60 * time.Second,
+    }
 
-	if port == "" {
-		port = "8080" // fallback for Railway
-	}
-
-	if err := fasthttp.ListenAndServe(":"+port, h); err != nil {
-		log.Fatalf("Error in ListenAndServe: %s", err)
-	}
+    err := fasthttp.ListenAndServe(":"+port, requestHandler)
+    if err != nil {
+        log.Fatalf("fatal ListenAndServe error: %v\n", err)
+    }
 }
 
 func requestHandler(ctx *fasthttp.RequestCtx) {
-	val, ok := os.LookupEnv("KEY")
+    defer func() {
+        if r := recover(); r != nil {
+            log.Printf("⚠️ panic recovered: %v\n", r)
+            ctx.SetStatusCode(500)
+            ctx.SetBody([]byte(fmt.Sprintf("internal error: %v", r)))
+        }
+    }()
 
-	if ok && string(ctx.Request.Header.Peek("PROXYKEY")) != val {
-		ctx.SetStatusCode(407)
-		ctx.SetBody([]byte("Missing or invalid PROXYKEY header."))
-		return
-	}
+    log.Printf("%s %s\n", ctx.Method(), ctx.Request.URI().String())
 
-	pathParts := strings.SplitN(string(ctx.Request.Header.RequestURI())[1:], "/", 2)
-	if len(pathParts) < 2 {
-		ctx.SetStatusCode(400)
-		ctx.SetBody([]byte("URL format invalid. Expected /subdomain/path"))
-		return
-	}
+    // auth
+    if proxyKey != "" {
+        key := string(ctx.Request.Header.Peek("PROXYKEY"))
+        if key != proxyKey {
+            ctx.SetStatusCode(407)
+            ctx.SetBody([]byte("Missing or invalid PROXYKEY"))
+            return
+        }
+    }
 
-	response := makeRequest(ctx, pathParts, 1)
-	defer fasthttp.ReleaseResponse(response)
+    uri := string(ctx.Request.URI().Path())
+    parts := strings.SplitN(strings.TrimPrefix(uri, "/"), "/", 2)
+    if len(parts) < 2 {
+        log.Println("❌ invalid path:", uri)
+        ctx.SetStatusCode(400)
+        ctx.SetBody([]byte("URL format invalid. use /subdomain/path"))
+        return
+    }
 
-	ctx.SetStatusCode(response.StatusCode())
-	ctx.SetBody(response.Body())
-	response.Header.VisitAll(func(key, value []byte) {
-		ctx.Response.Header.Set(string(key), string(value))
-	})
+    resp := makeRequest(ctx, parts, 1)
+    defer fasthttp.ReleaseResponse(resp)
+
+    // mirror headers & status
+    ctx.SetStatusCode(resp.StatusCode())
+    resp.Header.VisitAll(func(key, value []byte) {
+        ctx.Response.Header.SetBytesKV(key, value)
+    })
+    ctx.SetBody(resp.Body())
 }
 
-func makeRequest(ctx *fasthttp.RequestCtx, pathParts []string, attempt int) *fasthttp.Response {
-	if attempt > retries {
-		resp := fasthttp.AcquireResponse()
-		resp.SetBody([]byte("Proxy failed to connect. Please try again."))
-		resp.SetStatusCode(500)
-		return resp
-	}
+func makeRequest(ctx *fasthttp.RequestCtx, parts []string, attempt int) *fasthttp.Response {
+    if attempt > retries {
+        r := fasthttp.AcquireResponse()
+        r.SetStatusCode(500)
+        r.SetBody([]byte("proxy: exceeded retry limit"))
+        return r
+    }
 
-	req := fasthttp.AcquireRequest()
-	defer fasthttp.ReleaseRequest(req)
+    subdomain, path := parts[0], parts[1]
+    upstream := fmt.Sprintf("https://%s.roblox.com/%s", subdomain, path)
+    log.Printf("→ upstream request: %s %s (attempt %d)\n", ctx.Method(), upstream, attempt)
 
-	subdomain := pathParts[0]
-	path := pathParts[1]
+    req := fasthttp.AcquireRequest()
+    defer fasthttp.ReleaseRequest(req)
+    req.Header.SetMethod(string(ctx.Method()))
+    req.SetRequestURI(upstream)
+    req.SetBody(ctx.Request.Body())
 
-	fullURL := "https://" + subdomain + ".roblox.com/" + path
-	req.SetRequestURI(fullURL)
-	req.Header.SetMethod(string(ctx.Method()))
-	req.SetBody(ctx.Request.Body())
+    // copy headers
+    ctx.Request.Header.VisitAll(func(k, v []byte) {
+        req.Header.SetBytesKV(k, v)
+    })
+    // spoof UA
+    req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
+    req.Header.Set("Accept", "application/json")
+    req.Header.Del("Roblox-Id")
 
-	// copy headers from client request to proxy request
-	ctx.Request.Header.VisitAll(func(key, value []byte) {
-		req.Header.Set(string(key), string(value))
-	})
+    resp := fasthttp.AcquireResponse()
+    if err := client.Do(req, resp); err != nil {
+        log.Printf("❌ upstream error: %v\n", err)
+        fasthttp.ReleaseResponse(resp)
+        return makeRequest(ctx, parts, attempt+1)
+    }
 
-	// spoofing to avoid being blocked
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
-	req.Header.Set("Accept", "application/json")
-	req.Header.Del("Roblox-Id") // remove any Roblox-Id just in case
-
-	resp := fasthttp.AcquireResponse()
-	err := client.Do(req, resp)
-
-	if err != nil {
-		fasthttp.ReleaseResponse(resp)
-		return makeRequest(ctx, pathParts, attempt+1)
-	}
-
-	return resp
+    log.Printf("← upstream status: %d\n", resp.StatusCode())
+    return resp
 }
